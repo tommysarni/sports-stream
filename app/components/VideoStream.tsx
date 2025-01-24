@@ -7,7 +7,6 @@ interface VideoStreamProps {
   url: string
 }
 
-
 async function runVideoPlayer(videoElement: HTMLVideoElement) {
   if (!Hls.isSupported()) throw new Error('HLS is not supported.');
 
@@ -56,7 +55,6 @@ const VideoStream: React.FC<VideoStreamProps> = ({ url }) => {
       </video>
     </div>
   );
-  
 };
 
 export default VideoStream;
