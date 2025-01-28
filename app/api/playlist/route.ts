@@ -9,20 +9,68 @@ const s3Client = new S3Client({
   }
 });
 
+async function getNextSegment(lastSegment: number, lines: string[], ip: string): Promise<string[]> {
+  const results = [];
+  let segmentCount = 0;
+  let lineCount = 0;
+
+  for (let line of lines) {
+
+    if (lineCount < 4) {
+
+      if (line.startsWith('#EXT-X-MEDIA-SEQUENCE')) {
+        line = `#EXT-X-MEDIA-SEQUENCE:${lastSegment}`;
+        line = line + '\n#EXT-X-PLAYLIST-TYPE:EVENT';
+      }
+
+      results.push(line);
+      lineCount++;
+    } else {
+      if (segmentCount === lastSegment) {
+        if (line.startsWith('#EXTINF')) {
+          const delayStr = line.replace('#EXTINF:', '');
+          const delayNum = Number(delayStr.slice(0, delayStr.length - 2)) || 0;
+          const delayOffest = Math.max(0, delayNum - 1);
+          idDict.set(ip, { segment: lastSegment, delay: delayOffest });
+        }
+
+        results.push(line);
+
+        if (line.endsWith('.ts')) {
+
+          results.push(`#EXT-X-PREFETCH:https://sports-stream-api.s3.us-east-1.amazonaws.com/hls/segment_${(segmentCount + 1).toString().padStart(3, '0')}.ts`);
+        }
+      }
+
+      if (line.endsWith('.ts')) {
+        segmentCount++;
+      }
+    }
+
+    if (segmentCount > lastSegment) break;
+  }
+
+  return results;
+}
+
+let lastSegment = 0;
+let timer: number = 0;
+const idDict: Map<string, { segment: number, delay: number }> = new Map();
+
+export const reset = () => {
+  lastSegment = 0;
+};
+
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
   const bucketName = process.env.AWS_BUCKET_NAME!;
   const fileKey = searchParams.get('fileKey');
+  const ip = request.headers.get('x-forwarded-for') || '';
+  // const lastSegment = Number(searchParams.get('lastSegment'));
 
-  if (!fileKey) {
-    return new NextResponse(JSON.stringify({ error: 'Missing fileKey parameter' }), {
-      status: 400,
-      headers: {
-        'Content-Type': 'application/json',
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET, OPTIONS',
-        'Access-Control-Allow-Headers': '*'
-      }
+  if (!fileKey || isNaN(lastSegment)) {
+    return new NextResponse(JSON.stringify({ error: 'Missing parameters' }), {
+      status: 400
     });
   }
 
@@ -47,24 +95,45 @@ export async function GET(request: Request) {
     }
 
     const originalPlaylist = await new Response(Body as ReadableStream).text();
-
-    // Update segment paths to point to S3
     const s3BaseUrl = `https://${bucketName}.s3.${process.env.AWS_REGION}.amazonaws.com/hls/`;
     const updatedPlaylist = originalPlaylist.replace(
       /^(?!http)(.+\.ts)$/gm,
       `${s3BaseUrl}$1`
     );
 
-    return new NextResponse(updatedPlaylist, {
-      status: 200,
+    let lines = updatedPlaylist.split('\n');
+    let prev = idDict.get(ip) || { delay: 0, segment: 0 };
+    lastSegment =  Number(prev.segment) || 0;
+    lines = await getNextSegment(lastSegment, lines, ip);
+    prev = idDict.get(ip)|| { delay: 0, segment: 0 };
+    idDict.set(ip, { ...prev, segment: lastSegment + 1 }); 
+    prev = idDict.get(ip) || { delay: 0, segment: 0 };
+
+
+
+    if (lastSegment === 127) {
+      lines.push('#EXT-X-ENDLIST');
+      idDict.delete(ip);
+    }
+
+    const manifest = lines.join('\n');
+
+    if (timer) {
+
+      await new Promise(resolve => setTimeout(resolve, timer * 1000));
+    }
+
+    if (prev.delay) {
+      timer = prev.delay;
+    } 
+
+    return new NextResponse(manifest, {
       headers: {
         'Content-Type': 'application/vnd.apple.mpegurl',
+        'Cache-Control': 'no-store',
         'Access-Control-Allow-Origin': '*',
         'Access-Control-Allow-Methods': 'GET, OPTIONS',
-        'Access-Control-Allow-Headers': '*',
-        'Cache-Control': 'no-store',  // Prevent caching
-        Pragma: 'no-cache',         // Disable caching for older browsers
-        Expires: '0'               // Expire immediately
+        'Access-Control-Allow-Headers': '*'
       }
     });
   } catch (error) {
